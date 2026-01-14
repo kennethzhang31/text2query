@@ -455,7 +455,7 @@ class TrainingStore:
         if type == "qna":
             if not question or not answer_sql:
                 raise ValueError("For type='qna', both 'question' and 'answer_sql' are required")
-            text_for_embedding = f"{question} {answer_sql}"
+            text_for_embedding = question
         elif type == "sql_example":
             if not content:
                 raise ValueError("For type='sql_example', 'content' is required")
@@ -1142,8 +1142,171 @@ class TrainingStore:
         }
     
     # ============================================================================
-    # DELETE 方法 
+    # UPDATE / DELETE 方法 
     # ============================================================================
+    async def update_item(
+        self,
+        *,
+        type: str,
+        id: int,
+        # Optional ownership fields
+        user_id: Optional[str] = None,
+        group_id: Optional[str] = None,
+        # Content fields (depends on type)
+        question: Optional[str] = None,
+        answer_sql: Optional[str] = None,
+        content: Optional[str] = None,
+        title: Optional[str] = None,
+        # Other fields
+        metadata: Optional[Dict[str, Any]] = None,
+        is_active: Optional[bool] = None,
+        # Whether to regenerate embedding when text fields change
+        regenerate_embedding: bool = True,
+    ) -> int:
+        """Update a single training item by id.
+
+        This method supports updating QnA, SQL example, and documentation rows.
+        It can optionally regenerate the embedding when text fields change.
+
+        Args:
+            type: One of "qna", "sql_example", "documentation"
+            id: Primary key id of the row to update
+            user_id: New user_id (optional)
+            group_id: New group_id (optional)
+            question: New question text (for type="qna")
+            answer_sql: New answer SQL (for type="qna")
+            content: New content (for type="sql_example" or "documentation")
+            title: New title (for type="documentation")
+            metadata: New metadata dict (will be stored as jsonb)
+            is_active: New active flag
+            regenerate_embedding: If True, will regenerate embedding when text fields are provided.
+                For:
+                    - qna: re-embeds when a new question is provided
+                    - sql_example: requires content when True
+                    - documentation: requires content (title optional) when True
+
+        Returns:
+            int: number of updated rows (0 or 1)
+        """
+        try:
+            adapter = self._get_adapter()
+
+            if type == "qna":
+                tbl = "qna"
+            elif type == "sql_example":
+                tbl = "sql_examples"
+            elif type == "documentation":
+                tbl = "documentation"
+            else:
+                raise ValueError(f"Unsupported type: {type}")
+
+            set_clauses: List[str] = []
+            params: List[Any] = []
+
+            # Ownership fields
+            if user_id is not None:
+                set_clauses.append(f"user_id = ${len(params) + 1}")
+                params.append(user_id)
+            if group_id is not None:
+                set_clauses.append(f"group_id = ${len(params) + 1}")
+                params.append(group_id)
+
+            # Content fields
+            if tbl == "qna":
+                if question is not None:
+                    set_clauses.append(f"question = ${len(params) + 1}")
+                    params.append(question)
+                if answer_sql is not None:
+                    set_clauses.append(f"answer_sql = ${len(params) + 1}")
+                    params.append(answer_sql)
+            elif tbl == "sql_examples":
+                if content is not None:
+                    set_clauses.append(f"content = ${len(params) + 1}")
+                    params.append(content)
+            else:  # documentation
+                if title is not None:
+                    set_clauses.append(f"title = ${len(params) + 1}")
+                    params.append(title)
+                if content is not None:
+                    set_clauses.append(f"content = ${len(params) + 1}")
+                    params.append(content)
+
+            # Other fields
+            if metadata is not None:
+                metadata_json = json.dumps(metadata, ensure_ascii=False)
+                set_clauses.append(f"metadata = ${len(params) + 1}::jsonb")
+                params.append(metadata_json)
+            if is_active is not None:
+                set_clauses.append(f"is_active = ${len(params) + 1}")
+                params.append(is_active)
+
+            # Embedding regeneration
+            if regenerate_embedding:
+                text_for_embedding: Optional[str] = None
+
+                if tbl == "qna":
+                    if question is not None:
+                        text_for_embedding = question
+                elif tbl == "sql_examples":
+                    if not content:
+                        raise ValueError(
+                            "For type='sql_example', 'content' is required "
+                            "when regenerate_embedding=True"
+                        )
+                    text_for_embedding = content
+                elif tbl == "documentation":
+                    if not content:
+                        raise ValueError(
+                            "For type='documentation', 'content' is required "
+                            "when regenerate_embedding=True"
+                        )
+                    title_part = f"{title} " if title else ""
+                    text_for_embedding = f"{title_part}{content}"
+                else:
+                    raise ValueError(f"Unsupported type: {tbl}")
+
+                if text_for_embedding is not None:
+                    embedding = await self._generate_embedding(text_for_embedding)
+                    embedding_str = "[" + ",".join(map(str, embedding)) + "]"
+                    set_clauses.append(f"embedding = ${len(params) + 1}::vector")
+                    params.append(embedding_str)
+
+            if not set_clauses:
+                # Nothing to update
+                self.logger.info(
+                    f"No fields provided to update for {self.training_schema}.{tbl} id={id}"
+                )
+                return 0
+
+            # Always update updated_at
+            set_clauses.append("updated_at = now()")
+
+            set_sql = ", ".join(set_clauses)
+            where_param_idx = len(params) + 1
+            update_sql = f"""
+                UPDATE {self.training_schema}.{tbl}
+                SET {set_sql}
+                WHERE id = ${where_param_idx}
+                RETURNING id
+            """
+            params.append(id)
+
+            result = await adapter.sql_execution(update_sql, params=tuple(params), safe=False, limit=None)
+            if result.get("success"):
+                rows = result.get("result", []) or []
+                updated = len(rows)
+                self.logger.info(
+                    f"Updated {updated} row(s) in {self.training_schema}.{tbl} with id={id}"
+                )
+                return updated
+            else:
+                error_msg = result.get("error", "Unknown error")
+                self.logger.error(f"Failed to update item: {error_msg}")
+                return 0
+        except Exception as e:
+            self.logger.exception(f"Error updating item: {e}")
+            return 0
+
     async def delete_item(
         self,
         *,
