@@ -3,6 +3,7 @@ from typing import Any, Dict, Optional, List, Tuple
 from pathlib import Path
 import yaml
 import logging
+import re
 
 from .state import WisbiState
 from ..utils.models import agenerate_chat, ModelConfig
@@ -161,7 +162,25 @@ class TemplateNode:
         llm_config = state.get("llm_config")
         messages = [{"role": "user", "content": prompt}]
         response = await agenerate_chat(llm_config, messages)
-        return yaml.safe_load(response)
+        sanitized = self._sanitize_yaml_response(response)
+        parsed = yaml.safe_load(sanitized) or {}
+        if not isinstance(parsed, dict):
+            logger.warning("TemplateNode plan returned non-dict YAML; defaulting to empty components")
+            return {"components": {}}
+        return parsed
+
+    @staticmethod
+    def _sanitize_yaml_response(response: Any) -> str:
+        """Strip markdown code fences or extraneous text from LLM output."""
+        if response is None:
+            return ""
+        text = str(response).strip()
+        if "```" not in text:
+            return text
+        match = re.search(r"```(?:yaml)?\s*(.*?)\s*```", text, re.IGNORECASE | re.DOTALL)
+        if match:
+            return match.group(1).strip()
+        return text.replace("```yaml", "").replace("```", "").strip()
 
     async def __call__(self, state: WisbiState) -> WisbiState:
         """Execute template node: plan query and find matching templates
